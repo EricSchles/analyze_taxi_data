@@ -1,0 +1,196 @@
+import pandas as pd
+from scipy import stats
+import numpy as np
+import math
+from xgboost.sklearn import XGBRegressor
+from sklearn import ensemble
+from sklearn.grid_search import GridSearchCV
+from sklearn.grid_search import RandomizedSearchCV
+from sklearn.model_selection import train_test_split
+import xgboost as xgb
+from sklearn import preprocessing
+import json
+from sklearn import metrics
+from multiprocessing import cpu_count
+from numba import jit
+from dask import dataframe as dd
+from dask.multiprocessing import get
+
+
+@jit
+def generate_hour_column(x):
+    x["hour"] = x["lpep_pickup_datetime"].hour
+    return x
+
+
+def distance_feature_engineering(sample):
+    ONE_MINUTE = 60
+    ONE_HOUR = 60
+    boolean_map = {
+        True: 1,
+        False: 0
+    }
+    sample = sample[sample["Trip_distance"] != 0]
+    sample["duration"] = (sample["Lpep_dropoff_datetime"] - sample["lpep_pickup_datetime"])
+    sample["duration"] = np.array([elem.seconds/(ONE_MINUTE*ONE_HOUR) for elem in sample["duration"]])
+    sample["ave_speed"] = sample["Trip_distance"] / sample["duration"]  
+    
+    sample["under_one"] = sample["Trip_distance"] <= 1
+    sample["three_and_half_or_more"] = sample["Trip_distance"] >= 3.5
+    sample["between_one_and_three"] = (sample["Trip_distance"] > 1) & (sample["Trip_distance"] < 3.5)
+    sample["during_heavy_traffic"] = (sample["hour"] >= 7) & (sample["hour"] <= 19)
+    
+    sample["under_one"] = sample["under_one"].map(boolean_map)
+    sample["three_and_half_or_more"] = sample["three_and_half_or_more"].map(boolean_map)
+    sample["between_one_and_three"] = sample["between_one_and_three"].map(boolean_map)
+    sample["during_heavy_traffic"] = sample["during_heavy_traffic"].map(boolean_map)
+    return sample
+
+
+def is_sunday_wednesday(x):
+    isocal = x.isocalendar()
+    if isocal[2] == 7 or isocal[2] <= 3:
+        return True
+    else:
+        return False
+
+    
+def shift(x):
+    if x.hour >= 8 and x.hour < 16:
+        return 1
+    elif x.hour >= 16 and x.hour < 24:
+        return 2
+    else:
+        return 3
+
+    
+def shift_change(x):
+    if x.hour >= 16 and x.hour < 17:
+        return True
+    elif x.hour >= 23 and x.hour < 24:
+        return True
+    elif x.hour >= 7 and x.hour < 8:
+        return True
+    else:
+        return False
+
+    
+def before_work(x):
+    isocal = x.isocalendar()
+    if isocal[2] <= 5 and x.hour <=9 and x.hour > 5:
+        return True
+    else:
+        return False
+    
+
+def during_work(x):
+    isocal = x.isocalendar()
+    if isocal[2] <= 5 and x.hour >9 and x.hour <= 17:
+        return True
+    else:
+        return False
+
+    
+def after_work(x):
+    isocal = x.isocalendar()
+    if isocal[2] <= 5 and x.hour > 17 and x.hour <= 5:
+        return True
+    else:
+        return False
+
+    
+def time_feature_engineering(sample):
+    boolean_map = {
+        True: 1,
+        False: 0
+    }
+    map_week = {
+        36:1,
+        37: 2,
+        38: 3,
+        39: 4,
+        40: 5
+    }
+    sample["which_week"] = sample["lpep_pickup_datetime"].apply(lambda x: x.isocalendar()[1])
+    sample["day_of_week"] = sample["lpep_pickup_datetime"].apply(lambda x: x.isocalendar()[2])
+    sample["before_work"] = sample["lpep_pickup_datetime"].apply(before_work)
+    sample["during_work"] = sample["lpep_pickup_datetime"].apply(during_work)
+    sample["after_work"] = sample["lpep_pickup_datetime"].apply(after_work)
+    sample["sunday_wednesday"] = sample["lpep_pickup_datetime"].apply(is_sunday_wednesday)
+    sample["thursday_saturday"] = sample["sunday_wednesday"].apply(lambda x: not x)
+    sample["shift"] = sample["lpep_pickup_datetime"].apply(shift)
+    sample["shift_change"] = sample["lpep_pickup_datetime"].apply(shift_change)
+    
+    sample["before_work"] = sample["before_work"].map(boolean_map)
+    sample["during_work"] = sample["during_work"].map(boolean_map)
+    sample["after_work"] = sample["after_work"].map(boolean_map)
+    sample["shift_change"] = sample["shift_change"].map(boolean_map)
+    sample["sunday_wednesday"] = sample["sunday_wednesday"].map(boolean_map)
+    sample["thursday_saturday"] = sample["thursday_saturday"].map(boolean_map)
+    sample["which_week"] = sample["which_week"].map(map_week)
+    return sample
+
+
+def test_distance_time_price_feature_xgbr(sample):
+    X = sample[["Tip_amount", 
+                "Total_amount",
+                "Tolls_amount",
+                "improvement_surcharge",
+                "Trip_distance",   
+                "during_heavy_traffic",
+                "during_work"]]
+    y = sample["tip_percentage"]
+    
+    param_grid = {"criterion": ["mse", "friedman_mse"],
+              "min_samples_split": [2, 10, 20],
+              "max_depth": [None, 2, 10, 20],
+              "min_samples_leaf": [1, 5, 10],
+              "max_leaf_nodes": [None, 5, 10, 20],
+              "min_impurity_decrease":[0.1, 0.3, 0.5, 0.7]
+              }
+    xgb1 = XGBRegressor()
+    parameters = {'objective':['reg:linear'],
+                  'learning_rate': [.03, 0.05], 
+                  'max_depth': [5, 10, 15],
+                  'min_child_weight': [5, 10, 15],
+                  'silent': [1],
+                  'subsample': [0.3, 0.5],
+                  'colsample_bytree': [0.3, 0.5],
+                  'colsample_bylevel': [0.3, 0.5],
+                  'reg_lambda':[0.5, 1, 5],
+                  'n_estimators': [50, 100, 500]}
+
+    grid_search = GridSearchCV(xgb1,
+                            parameters,
+                            cv = 2,
+                            n_jobs = 5,
+                            verbose=True,
+                            scoring="neg_mean_squared_error")
+
+    grid_search.fit(X, y)
+    grid_scores = grid_search.grid_scores_
+    top_scores = sorted(grid_scores,
+                       key=lambda t:t[1],
+                        reverse=True)[:3]
+    for index, score in enumerate(top_scores):
+        print("Model Rank", index+1)
+        print("Mean validation Score", score.mean_validation_score)
+        print("Std of validation score", np.std(score.cv_validation_scores))
+        print("Parameters:", score.parameters)
+
+        
+if __name__ == '__main__':
+    sample = pd.read_csv("sample.csv")
+    sample["lpep_pickup_datetime"] = pd.to_datetime(sample["lpep_pickup_datetime"])
+    sample["Lpep_dropoff_datetime"] = pd.to_datetime(sample["Lpep_dropoff_datetime"])
+
+    nCores = cpu_count()
+    sample = dd.from_pandas(sample, npartitions=nCores).map_partitions(
+        lambda df : df.apply(generate_hour_column, axis=1)
+    ).compute(get=get)
+    sample = distance_feature_engineering(sample)
+    sample = sample.replace([np.inf, -np.inf], np.nan)
+    sample = sample.dropna()
+    sample = time_feature_engineering(sample)
+
+    test_distance_time_price_feature_xgbr(sample)
